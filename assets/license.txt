@@ -1,0 +1,31 @@
+SMART ACCOUNT PRO  -  SOFTWARE LICENSE / उपयोग की शर्तें
+Copyright (c) Shiv Computer. All rights reserved.
+
+1. LICENSE
+   Shiv Computer grants you the right to install and use Smart Account Pro on the
+   computers of your own institute / office. You may not sell, rent, reverse-engineer
+   or redistribute the software without written permission from Shiv Computer.
+
+2. YOUR DATA
+   All accounts data is stored only on your own computer (sap.db). Nothing is sent
+   over the internet. You are responsible for taking regular backups
+   (Settings > Backup). The software also keeps automatic daily backups in the
+   "sap_auto_backup" folder inside the data folder.
+
+3. NO WARRANTY
+   The software is provided "as is", without warranty of any kind. Shiv Computer is not
+   liable for any loss arising from its use. Please verify important figures.
+
+1. लाइसेंस
+   Shiv Computer आपको Smart Account Pro को अपने संस्थान / कार्यालय के कंप्यूटरों पर
+   install करके चलाने का अधिकार देता है। Shiv Computer की लिखित अनुमति के बिना इसे बेचना,
+   किराये पर देना, reverse-engineer करना या दोबारा बाँटना मना है।
+
+2. आपका डेटा
+   सारा हिसाब-किताब सिर्फ़ आपके अपने कंप्यूटर (sap.db) में रहता है, इंटरनेट पर कुछ नहीं जाता।
+   नियमित Backup (Settings > Backup) लेना आपकी ज़िम्मेदारी है। सॉफ़्टवेयर हर दिन अपने-आप
+   "sap_auto_backup" फ़ोल्डर में भी बैकअप रखता है।
+
+3. कोई गारंटी नहीं
+   सॉफ़्टवेयर "जैसा है वैसा" दिया जाता है। इसके उपयोग से हुई किसी हानि के लिए Shiv Computer
+   ज़िम्मेदार नहीं होगा। ज़रूरी आँकड़े ख़ुद जाँच लें।
