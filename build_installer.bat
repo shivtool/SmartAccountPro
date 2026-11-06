@@ -5,7 +5,7 @@ rem ============================================================
 rem  Smart Account Pro - EXE (Nuitka) + Setup.exe (Inno Setup)
 rem  Version badalne ke liye neeche APPVER badlein.
 rem ============================================================
-set "APPVER=2.0.1"
+set "APPVER=2.0.4"
 set "NFLAGS=--standalone --enable-plugin=tk-inter --windows-console-mode=disable --windows-icon-from-ico=assets\app.ico --output-filename=SmartAccountPro.exe --company-name="Shiv Computer" --product-name="Smart Account Pro" --file-description="Smart Account Pro" --file-version=%APPVER%.0 --product-version=%APPVER%.0 --copyright="Copyright (c) Shiv Computer" --assume-yes-for-downloads"
 
 set "ISCC="

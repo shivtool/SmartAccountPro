@@ -22,6 +22,7 @@ import math
 import time
 import base64
 import secrets
+import shutil
 import calendar
 import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, localcontext
@@ -170,7 +171,7 @@ KL = {"I": "आय", "E": "खर्च"}
 MS = ["जन.", "फ़र.", "मार्च", "अप्रैल", "मई", "जून", "जुला.", "अग.", "सित.", "अक्टू.", "नव.", "दिस."]
 MN = ["जनवरी", "फ़रवरी", "मार्च", "अप्रैल", "मई", "जून", "जुलाई", "अगस्त", "सितंबर", "अक्टूबर", "नवंबर", "दिसंबर"]
 HD = ["सोमवार", "मंगलवार", "बुधवार", "गुरुवार", "शुक्रवार", "शनिवार", "रविवार"]
-RT = [("account", "खाता-वार (Account wise)"), ("head", "हेड-वार (Head wise Expense)"), ("date", "तारीख-वार (Date wise)"),
+RT = [("account", "खाता-वार (Account wise)"), ("head", "हेड-वार (Head wise)"), ("date", "तारीख-वार (Date wise)"),
       ("day", "दिन-वार (Day wise)"), ("ledger", "खाता-बही (Ledger)"), ("credit", "Credit-वार"), ("debit", "Debit-वार"),
       ("month", "मासिक (Monthly)"), ("pl", "आय–खर्च (Income / Expense)"), ("year", "वार्षिक (Yearly)"),
       ("session", "सत्र-वार (अप्रैल–मार्च)")]
@@ -735,7 +736,12 @@ class Core:
             os.remove(tmp)
         self.export_db(tmp)
         os.replace(tmp, final)
-        old = sorted(glob.glob(os.path.join(glob.escape(folder), glob.escape(prefix) + "*.db")))
+        def _mtime(p):
+            try:
+                return os.path.getmtime(p)
+            except OSError:
+                return 0
+        old = sorted(glob.glob(os.path.join(glob.escape(folder), glob.escape(prefix) + "*.db")), key=_mtime)
         for p in old[:-keep] if keep > 0 else []:
             try:
                 os.remove(p)
@@ -969,41 +975,26 @@ class Core:
         return [t for grp in sel for t in grp], len(gs), sr
 
     def report(self, rp):
-        o, A = self.office(), self.accs()
+        o = self.office()
+        A = self.by_kind(self.accs())          # pehle aay khate, phir kharch khate
         S = [a for a in A if a["id"] == rp["aid"]] if rp["aid"] else A
         ids = {a["id"] for a in S}
-        allt = [t for t in self.txs() if t["aid"] in ids]
         frm, to = rp["from"], rp["to"]
 
-        # Smart Name Filtering (Normalized & Case-Insensitive Security with exact word/substring matching)
-        name_filter = norm(rp.get("name_filter", ""))
+        # Vivaran / Naam filter: likhe huye sabhi shabd milne chahiye (chhote-bade akshar ka fark nahi).
+        words = norm(rp.get("name_filter", "")).split()
+        filt = bool(words)
 
-        def tx_matches_name_filter(t):
-            if not name_filter:
-                return True
-            acc = self.acc(t["aid"])
-            haystack = " ".join(str(x) for x in [
-                self.name(t["aid"]),
-                acc.get("name", "") if acc else "",
-                acc.get("head", "") if acc else "",
-                acc.get("code", "") if acc else "",
-                t.get("note", ""),
-                t.get("vno") or "",
-                t.get("tid") or "",
-            ])
-            return name_filter in norm(haystack)
+        def tx_matches(t):
+            acc = self.acc(t["aid"]) or {}
+            hay = norm(" ".join(str(x) for x in (acc.get("name", ""), acc.get("head", ""), acc.get("code", ""),
+                                                 t.get("note", ""), t.get("vno") or "")))
+            return all(w in hay for w in words)
 
-        filtered_txs = []
-        for t in allt:
-            if frm and t["date"] < frm:
-                continue
-            if to and t["date"] > to:
-                continue
-            if not tx_matches_name_filter(t):
-                continue
-            filtered_txs.append(t)
-
-        L = sorted(filtered_txs, key=lambda t: t["date"])
+        # Filter lagne par Opening bhi usi filter se banti hai, taaki Opening + Credit - Debit = Closing hamesha mile.
+        allt = [t for t in self.txs() if t["aid"] in ids and (not filt or tx_matches(t))]
+        L = sorted((t for t in allt if not (frm and t["date"] < frm) and not (to and t["date"] > to)),
+                   key=lambda t: t["date"])
         by_all, by_L = {}, {}
         for t in allt:
             by_all.setdefault(t["aid"], []).append(t)
@@ -1021,60 +1012,116 @@ class Core:
         exAdd = lambda l: sum(amt(t) for t in l if pex(t) > 0)
         exRed = lambda l: sum(amt(t) for t in l if pex(t) < 0)
         ntC = lambda l: sum(amt(t) for t in l if kmap[t["aid"]] == "I" and t["type"] == "C" and not t.get("tid"))
+        base = (lambda a: 0) if filt else (lambda a: pz(a["open"]))
         title = dict(RT)[rp["type"]]
-        note = ""
+        note, sub, cards = "", set(), []
+        tone = lambda v: "c" if v >= 0 else "d"
+
+        def four(op, c, d, cl, raw=False):
+            if agg and not raw:
+                lab = ("Opening", "आय (Credit)", "खर्च/निकासी (Debit)", "बचा हुआ पैसा")
+            elif agg:
+                lab = ("Opening", "कुल Credit", "कुल Debit", "बचा हुआ पैसा")
+            elif oneE:
+                lab = ("पिछला खर्च", "वापसी (Credit)", "नया खर्च (Debit)", "कुल खर्च")
+            else:
+                lab = ("Opening", "Credit (जमा)", "Debit (निकासी)", "Closing")
+            return [(lab[0], rup(op), "n"), (lab[1], rup(c), "c"), (lab[2], rup(d), "d"),
+                    (lab[3], rup(cl), "d" if oneE else tone(cl))]
 
         def opening():
-            return sum((pz(a["open"]) if isI(a) or not agg else -pz(a["open"])) + bef(by_all.get(a["id"], []), st) for a in S)
+            return sum((base(a) if isI(a) or not agg else -base(a)) + bef(by_all.get(a["id"], []), st) for a in S)
 
         ty = rp["type"]
         if ty == "account":
             H = ["Code", "खाता", "Head", "Opening", "Credit", "Debit", "Closing"]
             R, tot = [], [0, 0, 0, 0]
+            grp = {"I": [0, 0, 0, 0], "E": [0, 0, 0, 0]}
+            ng = {"I": 0, "E": 0}
             for a in S:
                 ls, l = by_all.get(a["id"], []), by_L.get(a["id"], [])
                 nm = a["name"] + (f" ({KL[self.kd(a)]})" if agg else "")
-                head = a.get("head", "-")
-                code = a.get("code", "-") or "-"
                 if isI(a):
-                    op, c, d = pz(a["open"]) + bef(ls, pnet), sum_(l, "C"), sum_(l, "D")
-                    close_amt = op + c - d
+                    op, c, d = base(a) + bef(ls, pnet), sum_(l, "C"), sum_(l, "D")
+                    cl = op + c - d
                 else:
-                    op, c, d = pz(a["open"]) + bef(ls, pex), exRed(l), exAdd(l)
-                    close_amt = op + d - c
-                R.append([code, nm, head, rup(op), rup(c), rup(d), rup(close_amt)])
-                for i, v in enumerate((op, c, d, close_amt)):
+                    op, c, d = base(a) + bef(ls, pex), exRed(l), exAdd(l)
+                    cl = op + d - c
+                R.append([a.get("code") or "-", nm, a.get("head") or "-", rup(op), rup(c), rup(d), rup(cl)])
+                k = self.kd(a)
+                ng[k] += 1
+                for i, v in enumerate((op, c, d, cl)):
                     tot[i] += v
+                    grp[k][i] += v
+            if agg and ng["I"] and ng["E"]:
+                R.insert(ng["I"], ["", "कुल आय खाते", ""] + [rup(x) for x in grp["I"]])
+                R.append(["", "कुल खर्च खाते (खर्च)", ""] + [rup(x) for x in grp["E"]])
+                sub = {ng["I"], len(R) - 1}
             if agg:
                 op = opening()
                 e = op + sum(st(t) for t in L)
                 cr = ntC(L)
-                F = ["कुल (खर्च निकालकर)", "", "", rup(op), rup(cr), rup(op + cr - e), rup(e)]
+                F = ["", "बचा हुआ पैसा (खर्च निकालकर)", "", rup(op), rup(cr), rup(op + cr - e), rup(e)]
+                cards = four(op, cr, op + cr - e, e)
             else:
-                F = ["कुल", "", ""] + [rup(x) for x in tot]
+                F = ["", "कुल", ""] + [rup(x) for x in tot]
+                cards = four(*tot)
             if any(not isI(a) for a in S):
-                note = "नोट: खर्च खाते का Opening Balance शुरुआती खर्च है; Debit = खर्च, Credit = वापसी/घटत, Closing = कुल खर्च।"
+                note = "नोट: खर्च खाते का Opening = शुरुआती खर्च; Debit = नया खर्च, Credit = वापसी/घटत, Closing = कुल खर्च।"
                 if agg:
-                    note += ' अंतिम "कुल" पंक्ति = बचा हुआ पैसा (आय − खर्च)।'
+                    note += (" आख़िरी पंक्ति (बचा हुआ पैसा): Opening = आय Opening − खर्च Opening; Credit = आय की जमा; "
+                             "Debit = निकासी + खर्च (वापसी घटाकर)।")
         elif ty == "head":
-            H = ["Expense Head", "खातों की संख्या", "कुल खर्च (₹)"]
-            head_map = {}
-            for a in (S if rp["aid"] else A):
-                if self.kd(a) == "E":
-                    h_name = a.get("head", "Other") or "Other"
-                    l = by_L.get(a["id"], [])
-                    exp_amt = sum(pex(t) for t in l)
-                    if h_name not in head_map:
-                        head_map[h_name] = {"count": 0, "amt": 0}
-                    head_map[h_name]["count"] += 1
-                    head_map[h_name]["amt"] += exp_amt
+            # Head-wise: chuni hui avadhi ka Opening / Credit / Debit / Closing, aay aur kharch Heads alag-alag.
+            H = ["हेड (Head)", "खाते", "Opening", "Credit", "Debit", "Closing", "एंट्री", "हिस्सा %"]
+            secs = {"I": {}, "E": {}}
+            for a in S:
+                k = self.kd(a)
+                ls, l = by_all.get(a["id"], []), by_L.get(a["id"], [])
+                if k == "I":
+                    op, c, d = base(a) + bef(ls, pnet), sum_(l, "C"), sum_(l, "D")
+                    cl = op + c - d
+                else:
+                    op, c, d = base(a) + bef(ls, pex), exRed(l), exAdd(l)
+                    cl = op + d - c
+                label = str(a.get("head") or "Other").strip() or "Other"
+                rec = secs[k].setdefault(label.casefold(), {"name": label, "acc": 0, "n": 0, "v": [0, 0, 0, 0]})
+                rec["acc"] += 1
+                rec["n"] += len(l)
+                for i, v in enumerate((op, c, d, cl)):
+                    rec["v"][i] += v
             R = []
-            tot_amt = 0
-            for h_name, data in sorted(head_map.items()):
-                R.append([h_name, data["count"], rup(data["amt"])])
-                tot_amt += data["amt"]
-            F = ["कुल खर्च Head-wise", "", rup(tot_amt)]
-            note = "यह रिपोर्ट आपके द्वारा निर्धारित किए गए खर्च Heads के आधार पर सटीक विवरण दिखाती है।"
+            tots = {}
+            for k, title_ in (("I", "▌ आय (Income) Heads"), ("E", "▌ खर्च (Expense) Heads")):
+                # jis Head mein na Opening hai na is avadhi ki koi entry, use dikhane ki zaroorat nahi
+                rows_ = [r_ for _k, r_ in sorted(secs[k].items()) if r_["n"] or any(r_["v"])]
+                if not rows_:
+                    continue
+                tv = [sum(r_["v"][i] for r_ in rows_) for i in range(4)]
+                tn, ta = sum(r_["n"] for r_ in rows_), sum(r_["acc"] for r_ in rows_)
+                tots[k] = tv
+                R.append([title_, "", "", "", "", "", "", ""])
+                sub.add(len(R) - 1)
+                move = (lambda v: v[1] - v[2]) if k == "I" else (lambda v: v[2] - v[1])
+                mt = move(tv)
+                for r_ in rows_:
+                    R.append([r_["name"], str(r_["acc"])] + [rup(x) for x in r_["v"]] + [str(r_["n"]),
+                              f"{move(r_['v']) * 100 / mt:.1f}%" if mt > 0 else "—"])
+                R.append(["कुल आय" if k == "I" else "कुल खर्च", str(ta)] + [rup(x) for x in tv] + [str(tn), "100%" if mt > 0 else ""])
+                sub.add(len(R) - 1)
+            # Bacha hua paisa: poore (chune hue) khaton ka aay - kharch, dashboard ke hisaab se
+            stA = lambda t: pnet(t) if kmap[t["aid"]] == "I" else pdn(t)
+            opA = sum((base(a) if isI(a) else -base(a)) + bef(by_all.get(a["id"], []), stA) for a in S)
+            eA = opA + sum(stA(t) for t in L)
+            crA = ntC(L)
+            dA = opA + crA - eA
+            F = ["बचा हुआ पैसा (आय − खर्च)", "", rup(opA), rup(crA), rup(dA), rup(eA), str(len(L)), ""]
+            cards = [("Opening", rup(opA), "n"), ("आय (Credit)", rup(crA), "c"), ("खर्च/निकासी (Debit)", rup(dA), "d"),
+                     ("Closing / बचा हुआ पैसा", rup(eA), tone(eA)), ("एंट्री", str(len(L)), "n")]
+            note = ("Opening = चुनी हुई शुरुआती तारीख से पहले तक का (खाते के Opening सहित); Closing = आख़िरी तारीख तक का। "
+                    "आय Head में Closing = बचा हुआ बैलेंस, खर्च Head में Closing = कुल खर्च। हिस्सा % = इस अवधि की गतिविधि "
+                    "(आय: Credit − Debit, खर्च: Debit − Credit)। एक ही नाम के Head (छोटे-बड़े अक्षर का फ़र्क छोड़कर) जुड़ जाते हैं; "
+                    "जिस Head में Opening और अवधि की entry दोनों शून्य हैं वह नहीं दिखता।")
         elif ty == "pl":
             def account_net(a):
                 l = by_L.get(a["id"], [])
@@ -1082,26 +1129,29 @@ class Core:
                     return sum(pex(t) for t in l)
                 l = [t for t in l if not t.get("tid")]
                 return sum_(l, "C") - sum_(l, "D")
-            ri = [["आय", a.get("code", "-"), a["name"], account_net(a)] for a in S if self.kd(a) == "I"]
-            re_ = [["खर्च", a.get("code", "-"), a["name"], account_net(a)] for a in S if self.kd(a) != "I"]
+            ri = [["आय", a.get("code") or "-", a["name"], account_net(a)] for a in S if self.kd(a) == "I"]
+            re_ = [["खर्च", a.get("code") or "-", a["name"], account_net(a)] for a in S if self.kd(a) != "I"]
             ti, te = sum(x[3] for x in ri), sum(x[3] for x in re_)
             H = ["श्रेणी", "Code", "खाता", "राशि"]
             R = [[x[0], x[1], x[2], rup(x[3])] for x in ri] + [["", "", "कुल आय", rup(ti)]] + \
                 [[x[0], x[1], x[2], rup(x[3])] for x in re_] + [["", "", "कुल खर्च", rup(te)]]
+            sub = {len(ri), len(ri) + 1 + len(re_)}
             F = ["", "", "शुद्ध बचत (आय − खर्च)", rup(ti - te)]
+            cards = [("कुल आय", rup(ti), "c"), ("कुल खर्च", rup(te), "d"), ("शुद्ध बचत", rup(ti - te), tone(ti - te))]
         elif ty == "ledger":
             H = ["तारीख", "Code", "खाता", "Head", "विवरण", "Credit", "Debit", "कुल खर्च" if oneE else "Balance"]
-            b = opening()
+            b = op0 = opening()
             R = [["", "", "", "", "पिछला खर्च (शुरू तक)" if oneE else "Opening Balance", "", "", rup(b)]]
+            sub = {0}
             for t in L:
                 b += st(t)
                 a_ = amt(t)
                 acc = self.acc(t["aid"])
-                code = acc.get("code", "-") if acc else "-"
-                head = acc.get("head", "") if acc else ""
-                R.append([dmy(t["date"]), code, self.name(t["aid"]), head, t.get("note", ""),
+                R.append([dmy(t["date"]), (acc.get("code") if acc else "") or "-", self.name(t["aid"]),
+                          (acc.get("head") if acc else "") or "", t.get("note", ""),
                           rup(a_) if t["type"] == "C" else "", rup(a_) if t["type"] == "D" else "", rup(b)])
             F = ["", "", "", "", "कुल", rup(sum_(L, "C")), rup(sum_(L, "D")), rup(b)]
+            cards = four(op0, sum_(L, "C"), sum_(L, "D"), b, raw=True) + [("एंट्री", str(len(L)), "n")]
         elif ty in ("date", "credit", "debit"):
             one = ty != "date"
             l = [t for t in L if t["type"] == "C"] if ty == "credit" else [t for t in L if t["type"] == "D"] if ty == "debit" else L
@@ -1109,12 +1159,19 @@ class Core:
             R = []
             for i, t in enumerate(l, 1):
                 acc = self.acc(t["aid"])
-                code = acc.get("code", "-") if acc else "-"
-                head = acc.get("head", "") if acc else ""
-                b = [str(i), dmy(t["date"]), code, self.name(t["aid"]), head, t.get("note", "")]
+                b = [str(i), dmy(t["date"]), (acc.get("code") if acc else "") or "-", self.name(t["aid"]),
+                     (acc.get("head") if acc else "") or "", t.get("note", "")]
                 a_ = rup(amt(t))
                 R.append(b + [a_] if one else b + [a_ if t["type"] == "C" else "", a_ if t["type"] == "D" else ""])
-            F = ["", "", "", "", "", "कुल", rup(sum(amt(t) for t in l))] if one else ["", "", "", "", "", "कुल", rup(sum_(l, "C")), rup(sum_(l, "D"))]
+            sc, sd = sum_(l, "C"), sum_(l, "D")
+            F = ["", "", "", "", "", "कुल", rup(sc + sd)] if one else ["", "", "", "", "", "कुल", rup(sc), rup(sd)]
+            if ty == "credit":
+                cards = [("एंट्री", str(len(l)), "n"), ("कुल Credit", rup(sc), "c")]
+            elif ty == "debit":
+                cards = [("एंट्री", str(len(l)), "n"), ("कुल Debit", rup(sd), "d")]
+            else:
+                cards = [("एंट्री", str(len(l)), "n"), ("कुल Credit", rup(sc), "c"), ("कुल Debit", rup(sd), "d"),
+                         ("अंतर (Credit − Debit)", rup(sc - sd), tone(sc - sd))]
         else:
             def sess(d):
                 y, mo = int(d[:4]), int(d[5:7])
@@ -1126,9 +1183,8 @@ class Core:
             g = {}
             for t in L:
                 g.setdefault(kf(t), []).append(t)
-            b = opening()
-            op0 = b
-            H = ["अवधि", "Opening", "Credit", "Debit", "Closing"]
+            b = op0 = opening()
+            H = ["अवधि", "Opening", "Credit", "Debit", "Closing", "एंट्री"]
             R, sc, sd = [], 0, 0
             for k in sorted(g):
                 p = b
@@ -1143,10 +1199,25 @@ class Core:
                     c, d = sum_(g[k], "C"), sum_(g[k], "D")
                 sc += c
                 sd += d
-                R.append([lb(k), rup(p), rup(c), rup(d), rup(b)])
-            F = ["कुल", rup(op0), rup(sc), rup(sd), rup(b)]
+                R.append([lb(k), rup(p), rup(c), rup(d), rup(b), str(len(g[k]))])
+            F = ["कुल", rup(op0), rup(sc), rup(sd), rup(b), str(len(L))]
+            cards = four(op0, sc, sd, b) + [("एंट्री", str(len(L)), "n")]
 
-        per = f"{dmy(frm) if frm else 'शुरू'} से {dmy(to) if to else 'आज तक'}" if (frm or to) else "सभी तारीख"
+        if filt and ty in ("account", "head", "ledger", "day", "month", "year", "session"):
+            note = (note + "\n" if note else "") + \
+                "फ़िल्टर लगा है: Opening/Closing सिर्फ़ मिलती-जुलती entries के हिसाब से हैं (खाते का Opening Balance शामिल नहीं)।"
+
+        def col_align(i, h):
+            if h in ("Code", "#", "खाते", "खातों की संख्या", "एंट्री"):
+                return "c"
+            if h == "हिस्सा %" or isinstance(F[i], float) or any(isinstance(r_[i], float) for r_ in R):
+                return "r"
+            return "l"
+
+        if frm and frm == to:
+            per = f"{dmy(frm)} ({dn(frm)}) — एक दिन"
+        else:
+            per = f"{dmy(frm) if frm else 'शुरू'} से {dmy(to) if to else 'आज तक'}" if (frm or to) else "सभी तारीख"
         acname = self.name(rp["aid"]) if rp["aid"] else "सभी"
         acc_obj = self.acc(rp["aid"]) if rp["aid"] else None
         if acc_obj and acc_obj.get("code"):
@@ -1154,7 +1225,8 @@ class Core:
         if rp.get("name_filter"):
             per += f" | फ़िल्टर: {rp.get('name_filter')}"
         return {"H": H, "R": R, "F": F, "title": title, "per": per, "note": note, "acc": acname,
-                "office": o["name"] if o else "", "addr": (o.get("addr") if o else "") or ""}
+                "office": o["name"] if o else "", "addr": (o.get("addr") if o else "") or "",
+                "sub": sub, "cards": cards, "n": len(L), "align": [col_align(i, h) for i, h in enumerate(H)]}
 
     @staticmethod
     def cell(c, i, F):
@@ -1162,34 +1234,49 @@ class Core:
             return fmt(c)
         return str(c)
 
+    @staticmethod
+    def card_text(v):
+        return ("₹ " + fmt(v)) if isinstance(v, (int, float)) and not isinstance(v, bool) else str(v)
+
     def report_html(self, rep, logo_uri=""):
         s = self.db["setup"]
         H, R, F = rep["H"], rep["R"], rep["F"]
-        numeric = [isinstance(x, (int, float)) for x in F]
+        al = rep.get("align") or ["r" if isinstance(x, (int, float)) else "l" for x in F]
+        sub = rep.get("sub") or set()
+        acls = {"l": "", "c": ' class="c"', "r": ' class="n"'}
 
         def td(c, i, tag="td"):
-            is_code = (H[i] == "Code")
-            cls = ' class="n"' if numeric[i] else (' class="c"' if is_code else "")
-            return f"<{tag}{cls}>{'' if c == '' else escape(self.cell(c, i, F))}</{tag}>"
+            return f"<{tag}{acls.get(al[i], '')}>{'' if c == '' else escape(self.cell(c, i, F))}</{tag}>"
         w = PAPER.get(s["paper"], PAPER["A4"])
         w = w[1] if s["orient"] == "landscape" else w[0]
         pn = '@bottom-right{content:"पृष्ठ " counter(page) " / " counter(pages);font-size:9pt}' if s["pn"] else ""
-        body = ""
-        if R:
-            body = ("<table><thead><tr>" + "".join(td(h, i, "th") for i, h in enumerate(H)) + "</tr></thead><tbody>" +
-                    "".join("<tr>" + "".join(td(c, i) for i, c in enumerate(r)) + "</tr>" for r in R) +
-                    "</tbody><tfoot><tr>" + "".join(td(c, i) for i, c in enumerate(F)) + "</tr></tfoot></table>")
-            if rep["note"]:
-                body += f'<div class="mut" style="font-size:.85em;margin-top:6px">{escape(rep["note"])}</div>'
-        else:
-            body = '<p class="mut" style="text-align:center">इस अवधि में कोई रिकॉर्ड नहीं</p>'
-        sign = '<div class="sg"><span>तैयार करने वाला</span><span>जाँचकर्ता</span><span>अधिकृत हस्ताक्षर</span></div>' if s["sign"] else ""
         acc = THEMES.get(self.db.get("theme", ""), THEMES[""])[0]
         dark, tint = mix(acc, "#000000", 0.30), mix(acc, "#ffffff", 0.88)
+        body = ""
+        if R:
+            rows = []
+            for k, r in enumerate(R):
+                rc = ' class="sb"' if k in sub else ""
+                rows.append(f"<tr{rc}>" + "".join(td(c, i) for i, c in enumerate(r)) + "</tr>")
+            body = ("<table><thead><tr>" + "".join(td(h, i, "th") for i, h in enumerate(H)) + "</tr></thead><tbody>" +
+                    "".join(rows) + "</tbody><tfoot><tr>" + "".join(td(c, i) for i, c in enumerate(F)) + "</tr></tfoot></table>")
+            if rep["note"]:
+                body += '<div class="mut" style="font-size:.85em;margin-top:6px">' + \
+                        "<br>".join(escape(x) for x in rep["note"].split("\n")) + "</div>"
+        else:
+            body = '<p class="mut" style="text-align:center">इस अवधि में कोई रिकॉर्ड नहीं</p>'
+        tcol = {"c": CR_COL, "d": DR_COL, "n": acc}
+        cards = ""
+        if R and rep.get("cards"):
+            cards = '<div class="cd">' + "".join(
+                f'<div style="border-left-color:{tcol.get(tn, acc)}"><small>{escape(lbl)}</small>'
+                f'<b style="color:{tcol.get(tn, acc)}">{escape(self.card_text(v))}</b></div>'
+                for lbl, v, tn in rep["cards"]) + "</div>"
+        sign = '<div class="sg"><span>तैयार करने वाला</span><span>जाँचकर्ता</span><span>अधिकृत हस्ताक्षर</span></div>' if s["sign"] else ""
         logo = f'<img class="lg" src="{logo_uri}" alt="">' if logo_uri else ""
         gap = '<span class="sp"></span>' if logo_uri else ""
-        sub = " &nbsp;•&nbsp; ".join(escape(x) for x in (rep["addr"], s["title"]) if x)
-        ad = f'<div class="ad">{sub}</div>' if sub else ""
+        sub_t = " &nbsp;•&nbsp; ".join(escape(x) for x in (rep["addr"], s["title"]) if x)
+        ad = f'<div class="ad">{sub_t}</div>' if sub_t else ""
         return f"""<!DOCTYPE html><html lang="hi"><head><meta charset="utf-8"><title>{escape(rep['title'])}</title><style>
 @page{{size:{s['paper']} {s['orient']};margin:{s['mt']}mm {s['ml']}mm;{pn}}}
 *{{-webkit-print-color-adjust:exact;print-color-adjust:exact}}
@@ -1202,9 +1289,13 @@ body{{font:{s['fs']}px/1.4 "Segoe UI","Noto Sans Devanagari",sans-serif;color:#1
 .sh .ad{{font-size:.85em;color:#5c6f69}}
 .ri{{display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:4px 14px;margin:6px 0 8px;font-size:.92em}}
 .ri b{{font-size:1.12em;color:{acc}}}.ri span{{color:#5c6f69}}
+.cd{{display:flex;gap:8px;margin:0 0 8px;flex-wrap:wrap}}
+.cd div{{flex:1;min-width:90px;border:1px solid #d9dfdc;border-left:4px solid {acc};border-radius:3px;padding:3px 8px}}
+.cd small{{display:block;color:#5c6f69;font-size:.78em}}.cd b{{font-size:1.05em;white-space:nowrap}}
 table{{width:100%;border-collapse:collapse}}th,td{{padding:3px 7px;border-bottom:1px solid #d9dfdc;text-align:left}}
 th{{background:{tint};color:{dark};border-top:2px solid {acc};border-bottom:2px solid {acc}}}
-tbody tr:nth-child(even) td{{background:#f7f9f8}}.n{{text-align:right}}.c{{text-align:center}}
+tbody tr:nth-child(even) td{{background:#f7f9f8}}tbody tr.sb td{{background:{tint};font-weight:700}}
+.n{{text-align:right;white-space:nowrap}}.c{{text-align:center;white-space:nowrap}}
 tfoot{{display:table-row-group}}tfoot td{{font-weight:700;background:{tint};border-top:2px solid {acc}}}.mut{{color:#5c6f69}}
 .sg{{display:flex;justify-content:space-between;margin-top:40px;font-size:.9em}}
 .sg span{{border-top:1px solid #000;padding-top:4px;min-width:28%;text-align:center}}
@@ -1212,7 +1303,7 @@ tfoot{{display:table-row-group}}tfoot td{{font-weight:700;background:{tint};bord
 thead{{display:table-header-group}}tr{{break-inside:avoid}}
 </style></head><body><div class="sheet"><div class="sh">{logo}<div class="ht"><h1>{escape(rep['office'])}</h1>{ad}</div>{gap}</div>
 <div class="ri"><b>{escape(rep['title'])}</b><span>अवधि: {escape(rep['per'])} &nbsp;|&nbsp; खाता: {escape(rep['acc'])}</span></div>
-{body}{sign}<div class="pf">Print: {datetime.datetime.now().strftime('%d/%m/%Y, %I:%M:%S %p')}</div></div>
+{cards}{body}{sign}<div class="pf">Print: {datetime.datetime.now().strftime('%d/%m/%Y, %I:%M:%S %p')}</div></div>
 <script>window.onload=function(){{setTimeout(function(){{window.print()}},400)}}</script></body></html>"""
 
 # --------------------------------------------------------------------------- dialogs
@@ -1348,6 +1439,116 @@ def field(flow, label, cls, **kw):
     flow.add(fr)
     return w
 
+def pick_date(anchor, current="", allow_clear=False):
+    """Calendar popup (kisi extra package ki zaroorat nahi). Chuni tareekh ISO mein deta hai; "" = saaf; None = radd."""
+    cur = parse_date(current) or today()
+    sel = datetime.date.fromisoformat(cur)
+    tdy = datetime.date.fromisoformat(today())
+    d = _dialog(anchor, "तारीख चुनें")
+    res = [None]
+    view = [sel.year, sel.month]
+    f = ttk.Frame(d, padding=10)
+    f.pack()
+    head = ttk.Frame(f)
+    head.grid(row=0, column=0, sticky="ew")
+    lbl = ttk.Label(head, anchor="center", font=("Segoe UI", 11, "bold"), width=16)
+    days = ttk.Frame(f)
+    days.grid(row=1, column=0, pady=(6, 4))
+
+    def choose(v):
+        res[0] = v
+        d.destroy()
+
+    def step(n):
+        t = view[0] * 12 + view[1] - 1 + n
+        view[0], view[1] = t // 12, t % 12 + 1
+        draw()
+
+    def draw():
+        for w in days.winfo_children():
+            w.destroy()
+        lbl.config(text=f"{MN[view[1] - 1]} {view[0]}")
+        for i, nm in enumerate(("सो", "मं", "बु", "गु", "शु", "श", "र")):
+            tk.Label(days, text=nm, bg=PAL["bg"], fg=DR_COL if i == 6 else PAL["dark"], width=4,
+                     font=("Segoe UI", 9, "bold")).grid(row=0, column=i, pady=(0, 2), sticky="ew")
+        for r, week in enumerate(calendar.monthcalendar(view[0], view[1]), 1):
+            for c, day in enumerate(week):
+                if not day:
+                    continue
+                dt = datetime.date(view[0], view[1], day)
+                is_sel, is_tdy = dt == sel, dt == tdy
+                tk.Button(days, text=str(day), width=4, relief="flat", bd=0, cursor="hand2",
+                          bg=PAL["acc"] if is_sel else (PAL["tint"] if is_tdy else "#ffffff"),
+                          fg="#ffffff" if is_sel else (DR_COL if c == 6 else "#17302b"),
+                          activebackground=PAL["dark"], activeforeground="#ffffff",
+                          font=("Segoe UI", 10, "bold" if (is_sel or is_tdy) else "normal"),
+                          command=lambda v=dt.isoformat(): choose(v)).grid(row=r, column=c, padx=1, pady=1, ipady=2, sticky="ew")
+
+    for c_ in range(7):
+        days.columnconfigure(c_, weight=1, uniform="dy")
+    for txt, n, col in (("«", -12, 0), ("‹", -1, 1)):
+        ttk.Button(head, text=txt, width=3, command=lambda n=n: step(n)).grid(row=0, column=col)
+    lbl.grid(row=0, column=2, padx=6)
+    head.columnconfigure(2, weight=1)
+    for txt, n, col in (("›", 1, 3), ("»", 12, 4)):
+        ttk.Button(head, text=txt, width=3, command=lambda n=n: step(n)).grid(row=0, column=col)
+    bf = ttk.Frame(f)
+    bf.grid(row=2, column=0, pady=(4, 0))
+    ttk.Button(bf, text="आज", command=lambda: choose(today())).pack(side="left", padx=3)
+    if allow_clear:
+        ttk.Button(bf, text="साफ़", command=lambda: choose("")).pack(side="left", padx=3)
+    ttk.Button(bf, text="रद्द", command=d.destroy).pack(side="left", padx=3)
+    d.bind("<Escape>", lambda e: d.destroy())
+    d.bind("<Prior>", lambda e: step(-1))
+    d.bind("<Next>", lambda e: step(1))
+    draw()
+    d.update_idletasks()
+    x = anchor.winfo_rootx()
+    y = anchor.winfo_rooty() + anchor.winfo_height() + 2
+    x = max(0, min(x, d.winfo_screenwidth() - d.winfo_reqwidth() - 8))
+    if y + d.winfo_reqheight() > d.winfo_screenheight() - 40:
+        y = max(0, anchor.winfo_rooty() - d.winfo_reqheight() - 2)
+    d.geometry(f"+{x}+{y}")
+    _modal(d)
+    d.wait_window()
+    return res[0]
+
+def date_field(flow, label, on_pick=None, allow_clear=True):
+    """Tareekh wala box + 📅 button (calendar se tareekh chunne ke liye; F4 se bhi khulta hai)."""
+    fr = ttk.Frame(flow)
+    ttk.Label(fr, text=label).pack(anchor="w")
+    row = ttk.Frame(fr)
+    row.pack(fill="x")
+    e = ttk.Entry(row)
+
+    def pick(_=None):
+        v = pick_date(e, e.get(), allow_clear)
+        if v is None:
+            return "break"
+        e.delete(0, "end")
+        e.insert(0, dmy(v) if v else "")
+        e.focus_set()
+        if on_pick:
+            on_pick(e, v)
+        return "break"
+    btn = ttk.Button(row, text="📅", width=3, command=pick)
+    btn.pack(side="right", padx=(4, 0))
+    e.pack(side="left", fill="x", expand=True)
+    e.bind("<F4>", pick)
+    e.pick = pick
+    flow.add(fr)
+    return e
+
+def _wheel_dir(e):
+    """Mouse-wheel ki disha: -1 = upar, +1 = neeche, 0 = kuchh nahi (Windows / Linux / Mac teeno)."""
+    n = getattr(e, "num", 0)
+    if n == 4:
+        return -1
+    if n == 5:
+        return 1
+    d = getattr(e, "delta", 0) or 0
+    return -1 if d > 0 else (1 if d < 0 else 0)
+
 class ScrollFrame(ttk.Frame):
     _all = []
     _bound = False
@@ -1391,18 +1592,72 @@ class ScrollFrame(ttk.Frame):
                 ScrollFrame._bound = False
 
     @staticmethod
-    def _wheel(e):
-        w = e.widget
+    def scroll_from(widget, direction):
+        """`widget` jis ScrollFrame ke andar hai, use ek kadam scroll karo (sirf jab scroll ho sakta ho)."""
+        w = widget
         while w is not None and not isinstance(w, str):
-            if isinstance(w, (ttk.Treeview, tk.Listbox, tk.Text)):
-                return
             for sf in ScrollFrame._all:
                 if w is sf:
-                    if sf.cv.yview() != (0.0, 1.0):
-                        up = e.num == 4 or getattr(e, "delta", 0) > 0
-                        sf.cv.yview_scroll(-3 if up else 3, "units")
-                    return
+                    top, bottom = sf.cv.yview()
+                    if (direction < 0 and top > 0.0) or (direction > 0 and bottom < 1.0):
+                        sf.cv.yview_scroll(direction * 3, "units")
+                    return True
             w = getattr(w, "master", None)
+        return False
+
+    @staticmethod
+    def _wheel(e):
+        w = e.widget
+        if isinstance(w, (ttk.Treeview, tk.Listbox, tk.Text)):
+            return          # inka apna scroll hai (Treeview ka wheel make_tree mein sambhala gaya hai)
+        d = _wheel_dir(e)
+        if d:
+            ScrollFrame.scroll_from(w, d)
+
+def _tree_wheel(tr, e):
+    """Table ke upar wheel: pehle table scroll hoti hai; table ke kinare / chhoti table par poora page scroll hota hai."""
+    d = _wheel_dir(e)
+    if d:
+        top, bottom = tr.yview()
+        if (d < 0 and top > 0.0) or (d > 0 and bottom < 1.0):
+            tr.yview_scroll(d * 3, "units")
+        else:
+            ScrollFrame.scroll_from(tr, d)
+    return "break"
+
+def _tree_hwheel(tr, e):
+    """Shift + wheel = table ko daayen-baayen scroll karo."""
+    d = _wheel_dir(e)
+    if d:
+        tr.xview_scroll(d * 3, "units")
+    return "break"
+
+def _combo_wheel(e):
+    """Dropdown (Combobox) ke upar wheel se uski value na badle; uski jagah page scroll ho."""
+    d = _wheel_dir(e)
+    if d:
+        ScrollFrame.scroll_from(e.widget, d)
+    return "break"
+
+_WHEEL_SAVED = {}
+
+def fix_wheel(widget):
+    for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+        if seq not in _WHEEL_SAVED:
+            try:
+                _WHEEL_SAVED[seq] = widget.bind_class("TCombobox", seq)
+            except tk.TclError:
+                _WHEEL_SAVED[seq] = ""
+        widget.bind_class("TCombobox", seq, _combo_wheel)
+
+def unfix_wheel(widget):
+    """App band hone par Combobox ki asli (original) wheel-binding wapas laga do (embedded mode mein host ke liye)."""
+    for seq, script in list(_WHEEL_SAVED.items()):
+        try:
+            widget.bind_class("TCombobox", seq, script)
+        except tk.TclError:
+            pass
+    _WHEEL_SAVED.clear()
 
 _TREES = []
 
@@ -1410,6 +1665,7 @@ def tree_tags(tr):
     tr.tag_configure("odd", background=PAL["soft"])
     tr.tag_configure("cr", foreground=CR_COL)
     tr.tag_configure("dr", foreground=DR_COL)
+    tr.tag_configure("sub", font=("Segoe UI", 10, "bold"), background=mix(PAL["acc"], "#ffffff", 0.88), foreground=PAL["dark"])
     tr.tag_configure("foot", font=("Segoe UI", 10, "bold"), background=PAL["tint"], foreground=PAL["dark"])
 
 def make_tree(parent, cols, height=8, xscroll=False):
@@ -1428,6 +1684,10 @@ def make_tree(parent, cols, height=8, xscroll=False):
         xs.pack(side="bottom", fill="x")
     ys.pack(side="right", fill="y")
     tr.pack(side="left", fill="both", expand=True)
+    for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+        tr.bind(seq, lambda e, t=tr: _tree_wheel(t, e))
+    for seq in ("<Shift-MouseWheel>", "<Shift-Button-4>", "<Shift-Button-5>"):
+        tr.bind(seq, lambda e, t=tr: _tree_hwheel(t, e))
     if not xscroll:
         tot = sum(c[2] for c in cols)
 
@@ -1461,6 +1721,7 @@ class App(tk.Frame):
         self._tabmap = {}
         self._syncing_code = False
         self._syncing_rep_code = False
+        self._bk_dir = None
         requested_office = office_id or os.environ.get("FEEBOOK_SAP_OFFICE_ID")
         if requested_office and any(o["id"] == requested_office for o in self.db["offices"]):
             self.db["cur"] = requested_office
@@ -1496,6 +1757,7 @@ class App(tk.Frame):
         self.apply_theme()
         if not embedded:
             self.window.protocol("WM_DELETE_WINDOW", self.on_close)
+        fix_wheel(self)
         self.cleanup_reports()
         self.bind("<Destroy>", self._on_destroy, add="+")
         self.auto_backup(skip_existing=True)
@@ -1656,7 +1918,7 @@ class App(tk.Frame):
     def update_status(self):
         self._toast_job = None
         o = self.core.office()
-        self.sbar.config(text=f"✓ Ready   |   Office: {o['name'] if o else '—'}   |   खाते: {len(self.core.accs())}   |   एंट्री: {len(self.core.txs())} | Powerd By Shiv Computer")
+        self.sbar.config(text=f"✓ Ready   |   Office: {o['name'] if o else '—'}   |   खाते: {len(self.core.accs())}   |   एंट्री: {len(self.core.txs())} | Powered By Shiv Computer")
 
     def info(self, text, kind="info", title="Smart Account Pro"):
         msgbox(self, title, text, kind)
@@ -1708,7 +1970,7 @@ class App(tk.Frame):
     def safety_copy(self, what):
         try:
             self.core.snapshot(os.path.join(os.path.dirname(os.path.abspath(DB_FILE)), "sap_auto_backup"),
-                               f"sap_before_{what}_{datetime.datetime.now():%Y%m%d-%H%M%S}", "sap_before_", 10)
+                               f"sap_before_{what}_{datetime.datetime.now():%Y%m%d-%H%M%S-%f}", "sap_before_", 10)
             return True
         except Exception as exc:
             details = "Safety backup failed\n" + traceback.format_exc()
@@ -1725,6 +1987,7 @@ class App(tk.Frame):
             return False
         self._closed = True
         self._cancel_jobs()
+        unfix_wheel(self)
         self.auto_backup()
         self.core.close()
         self._stale.clear()
@@ -1958,7 +2221,7 @@ class App(tk.Frame):
         fl.grid(row=2, column=0, sticky="ew")
         self.ecode = field(fl, "Khata Code", ttk.Entry)
         self.ea = field(fl, "Khata", ttk.Combobox, state="readonly")
-        self.ed = field(fl, "Tareekh (DD-MM-YYYY)", ttk.Entry)
+        self.ed = date_field(fl, "Tareekh (DD-MM-YYYY)", allow_clear=False)
         self.em = field(fl, "Rashi ₹", ttk.Entry)
         self.en = field(fl, "Vivaran", ttk.Combobox)
         bf = ttk.Frame(self.ef)
@@ -2105,8 +2368,12 @@ class App(tk.Frame):
         else:
             self.db["tx"].append({"id": uid(), "oid": self.db["cur"], "vno": c.next_v(), "aid": aid, "type": typ,
                                   "date": date, "amt": amt, "note": note})
+        keep_date = None if self.edit else dmy(date)
         self.eq.set("")
         self.reset_form()
+        if keep_date:
+            self.ed.delete(0, "end")
+            self.ed.insert(0, keep_date)
         self.commit("Save ho gaya")
         self.em.focus_set()
 
@@ -2114,7 +2381,7 @@ class App(tk.Frame):
         rows, n, sr = self.core.last_tx(self.eq.get())
         tot = len({t.get("tid") or t["id"] for t in self.core.txs()})
         more = f"  (Pehli {MAXR} dikhayi gayi)" if len(rows) > MAXR else ""
-        self.eh.config(text=(f"🔎 {n} parinam mile" if sr else (f"🕘 Navनवीन {min(GL, n)} entry · Kul {tot}" if n else "Abhi koi entry nahi")) + more)
+        self.eh.config(text=(f"🔎 {n} parinam mile" if sr else (f"🕘 नवीन {min(GL, n)} entry · Kul {tot}" if n else "Abhi koi entry nahi")) + more)
         fill(self.e_tree, self.ent_rows(rows[:MAXR]))
 
     def sel(self, tree):
@@ -2129,7 +2396,7 @@ class App(tk.Frame):
         if not t:
             return
         if t.get("tid"):
-            return self.info("Yeh purani Transfer entry hai — isko sudहराnahi ja sakta.", "warn")
+            return self.info("Yeh purani Transfer entry hai — isko sudhara nahi ja sakta.", "warn")
         self.edit = tid
         self.ef.config(text="Entry Correction")
         self.acc_choices()
@@ -2209,12 +2476,12 @@ class App(tk.Frame):
         self.a_tree.bind("<Double-1>", lambda e: self.edit_acc())
 
     def next_suggested_code(self):
-        codes = []
-        for a in self.core.accs():
-            c = a.get("code", "").strip()
-            if c.isdigit():
-                codes.append(int(c))
-        return str(max(codes, default=100) + 1)
+        used = {norm(a.get("code", "")) for a in self.core.accs()}
+        nums = [int(x) for x in (str(a.get("code", "")).strip() for a in self.core.accs()) if x.isdigit() and int(x) < 900]
+        n = max(nums, default=100) + 1
+        while str(n) in used:
+            n += 1
+        return str(n)
 
     def refresh_acc(self):
         c = self.core
@@ -2285,6 +2552,9 @@ class App(tk.Frame):
         a = self.core.acc(aid) if aid else None
         if not a:
             return self.toast("Pehle khata chunein")
+        cnt = sum(1 for t in self.db["tx"] if t["aid"] == aid)
+        if cnt and not self.ask(f'"{a["name"]}" ki {cnt} entries ka hisaab (balance / kharch) badal jayega. Aay/Kharch badlein?'):
+            return
         a["kind"] = "E" if self.core.kd(a) == "I" else "I"
         self.commit(f"{a['name']} → {'आय (Income)' if a['kind'] == 'I' else 'व्यय (Expense)'}")
 
@@ -2306,49 +2576,108 @@ class App(tk.Frame):
         self.commit("Khata hata diya")
 
     # ---------------------------------------------------------------- report tab
+    REP_W = {"Code": 70, "#": 44, "तारीख": 100, "खाता": 190, "Head": 120, "विवरण": 300, "Expense Head": 190, "हेड (Head)": 200, "खाते": 70,
+             "अवधि": 190, "श्रेणी": 90, "खातों की संख्या": 115, "एंट्री": 80, "हिस्सा %": 90}
+
     def build_rep(self):
-        sf = ScrollFrame(self.t_rep)
-        sf.pack(fill="both", expand=True)
-        t = sf.inner
-        lf = ttk.LabelFrame(t, text="Report Options, Code & Name Filter", padding=10)
-        lf.pack(fill="x", padx=8, pady=(8, 4))
+        # Poora page scroll nahi hota: upar Options, beech mein summary cards, baaki jagah mein Preview table.
+        # Table ke apne vertical + horizontal scrollbar hain, isliye har jagah wheel/scrollbar theek chalta hai.
+        t = self.t_rep
+        t.columnconfigure(0, weight=1)
+        t.rowconfigure(2, weight=1)
+        self._rep_open = True
+        self.rep_opts = lf = ttk.LabelFrame(t, text="Report Options, Code & Name Filter", padding=(10, 6))
+        lf.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 2))
         lf.columnconfigure(0, weight=1)
-        fl = Flow(lf, 180)
+        fl = Flow(lf, 170)
         fl.grid(row=0, column=0, sticky="ew")
         self.rt = field(fl, "Report Prakar", ttk.Combobox, state="readonly", values=[x[1] for x in RT])
         self.rt.current(0)
         self.rcode = field(fl, "Khata Code (खाता कोड)", ttk.Entry)
         self.ra = field(fl, "Khata (खाता चुनें)", ttk.Combobox, state="readonly")
-        self.rf = field(fl, "Se (DD-MM-YYYY)", ttk.Entry)
-        self.rto = field(fl, "Tak (DD-MM-YYYY)", ttk.Entry)
+        self.rf = date_field(fl, "Se (DD-MM-YYYY)", self._on_rf_pick)
+        self.rto = date_field(fl, "Tak (DD-MM-YYYY)", self._on_rto_pick)
         self.rname = field(fl, "Vivaran / Naam Filter", ttk.Entry)
 
-        # Load Report Action Button
-        btn_box = ttk.Frame(lf)
-        btn_box.grid(row=1, column=0, sticky="w", pady=(8, 4))
-        ttk.Button(btn_box, text="🔄 Load Report", command=self.load_report_action, style="Ok.TButton").pack(side="left", padx=(0, 10))
-
-        self.rcode.bind("<KeyRelease>", lambda e: self.on_rep_code_change())
+        self.rcode.bind("<KeyRelease>", lambda e: self.on_rep_code_change() if self._is_typing(e) else None)
         self.ra.bind("<<ComboboxSelected>>", self.on_rep_acc_select)
-        self.rt.bind("<<ComboboxSelected>>", lambda e: self.rpu())
-
+        self.rt.bind("<<ComboboxSelected>>", lambda e: self.load_report_action(quiet=True, announce=False))
+        self.rname.bind("<KeyRelease>", lambda e: self.deb("rname", lambda: self.load_report_action(quiet=True, announce=False), 500) if self._is_typing(e) else None)
         for w in (self.rf, self.rto, self.rname, self.rcode):
             w.bind("<Return>", lambda e: self.load_report_action())
 
-        bf = Flow(lf, 150, "w")
-        bf.grid(row=2, column=0, sticky="ew", pady=(4, 0))
-        for txt, cmd in (("This Month", lambda: self.quick("m")), ("Current Session", lambda: self.quick("y")), ("Sabhi Tareekh", lambda: self.quick("")),
-                         ("🖨 Print / PDF", self.print_report), ("📊 Excel / CSV", self.export_csv), ("⚙ Page Setup", self.page_setup)):
-            bf.add(ttk.Button(bf, text=txt, command=cmd))
-        pv = ttk.LabelFrame(t, text="Preview", padding=8)
-        pv.pack(fill="both", expand=True, padx=8, pady=4)
-        self.rh = ttk.Label(pv, justify="center", anchor="center", font=("Segoe UI", 10))
-        self.rh.pack(fill="x")
-        fr, self.r_tree = make_tree(pv, [("x", "", 100, "w")], 12, xscroll=True)
+        bf = Flow(lf, 140, "w")
+        bf.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        for txt, cmd, sty in (("🔄 Load Report", self.load_report_action, "Ok.TButton"),
+                              ("Aaj", lambda: self.quick("d"), "TButton"),
+                              ("This Month", lambda: self.quick("m"), "TButton"),
+                              ("Current Session", lambda: self.quick("y"), "TButton"),
+                              ("Sabhi Tareekh", lambda: self.quick(""), "TButton"),
+                              ("🖨 Print / PDF", self.print_report, "TButton"),
+                              ("📊 Excel / CSV", self.export_csv, "TButton"),
+                              ("⚙ Page Setup", self.page_setup, "TButton")):
+            bf.add(ttk.Button(bf, text=txt, command=cmd, style=sty))
+
+        bar = ttk.Frame(t)
+        bar.grid(row=1, column=0, sticky="ew", padx=8, pady=(2, 2))
+        bar.columnconfigure(0, weight=1)
+        self.rcards = ttk.Frame(bar)
+        self.rcards.grid(row=0, column=0, sticky="ew")
+        self.rtoggle = ttk.Button(bar, text="▲ Options chhupayein", command=self.toggle_rep_opts)
+        self.rtoggle.grid(row=0, column=1, sticky="ne", padx=(8, 0))
+
+        pv = ttk.LabelFrame(t, text="Preview", padding=6)
+        pv.grid(row=2, column=0, sticky="nsew", padx=8, pady=(2, 8))
+        self.rh = ttk.Label(pv, justify="center", anchor="center", font=("Segoe UI", 10, "bold"))
+        self.rh.pack(side="top", fill="x", pady=(0, 4))
+        self.rn = ttk.Label(pv, foreground="#5c6f69", wraplength=600, justify="left")
+        self.rn.pack(side="bottom", anchor="w", fill="x", pady=(3, 0))
+        fr, self.r_tree = make_tree(pv, [("x", "", 100, "w")], 8, xscroll=True)
         fr.pack(fill="both", expand=True)
-        self.rn = ttk.Label(pv, foreground="#5c6f69", wraplength=600)
-        self.rn.pack(anchor="w", pady=2)
         pv.bind("<Configure>", lambda e: self.rn.config(wraplength=max(200, e.width - 30)))
+
+    @staticmethod
+    def _is_typing(e):
+        return e.keysym not in ("Return", "KP_Enter", "Tab", "ISO_Left_Tab", "Shift_L", "Shift_R", "Control_L", "Control_R",
+                                "Alt_L", "Alt_R", "Left", "Right", "Up", "Down", "Home", "End", "Escape", "Caps_Lock")
+
+    def _on_rf_pick(self, e, iso):
+        # "Se" mein tareekh chunne par "Tak" khali ho to wahi tareekh bhar do -> sirf wahi ek din dikhega
+        if iso and not self.rto.get().strip():
+            self.rto.insert(0, dmy(iso))
+        self.load_report_action(quiet=True, announce=False)
+
+    def _on_rto_pick(self, e, iso):
+        self.load_report_action(quiet=True, announce=False)
+
+    def toggle_rep_opts(self):
+        self._rep_open = not self._rep_open
+        if self._rep_open:
+            self.rep_opts.grid()
+            self.rtoggle.config(text="▲ Options chhupayein")
+        else:
+            self.rep_opts.grid_remove()
+            self.rtoggle.config(text="▼ Options dikhayein")
+
+    def draw_report_cards(self, cards):
+        for w in self.rcards.winfo_children():
+            w.destroy()
+        for i in range(10):
+            self.rcards.columnconfigure(i, weight=0, uniform="")
+        tones = {"c": (CR_COL, CR_BG), "d": (DR_COL, DR_BG), "n": (PAL["acc"], PAL["tint"])}
+        for i, (label, val, tone) in enumerate(cards[:10]):
+            col, bgc = tones.get(tone, tones["n"])
+            box = tk.Frame(self.rcards, bg=bgc, highlightthickness=1, highlightbackground=mix(col, "#ffffff", 0.60))
+            tk.Frame(box, width=5, bg=col).pack(side="left", fill="y")
+            inner = tk.Frame(box, bg=bgc)
+            inner.pack(side="left", fill="both", expand=True, padx=8, pady=3)
+            tk.Label(inner, text=label, bg=bgc, fg=MUTED, anchor="w", font=("Segoe UI", 8, "bold")).pack(fill="x")
+            tk.Label(inner, text=self.core.card_text(val), bg=bgc, fg=col, anchor="w", font=("Segoe UI", 12, "bold")).pack(fill="x")
+            box.grid(row=0, column=i, sticky="ew", padx=(0 if i == 0 else 6, 0), pady=2)
+            self.rcards.columnconfigure(i, weight=1, uniform="rc")
+
+    def _rep_reload_soon(self):
+        self.deb("rcode", lambda: self.load_report_action(quiet=True, announce=False), 450)
 
     def on_rep_code_change(self, *args):
         if self._syncing_rep_code:
@@ -2359,6 +2688,7 @@ class App(tk.Frame):
             self.ra.set("Sabhi Khate")
             self.rp["aid"] = ""
             self._syncing_rep_code = False
+            self._rep_reload_soon()
             return
         acc = next((a for a in self.core.accs() if norm(a.get("code", "")) == norm(code)), None)
         if acc:
@@ -2369,6 +2699,7 @@ class App(tk.Frame):
                     self.rp["aid"] = acc["id"]
                     break
             self._syncing_rep_code = False
+            self._rep_reload_soon()
 
     def on_rep_acc_select(self, _=None):
         if self._syncing_rep_code:
@@ -2382,36 +2713,34 @@ class App(tk.Frame):
             if acc and acc.get("code"):
                 self.rcode.insert(0, acc["code"])
         self._syncing_rep_code = False
-        self.rpu()
+        self.load_report_action(quiet=True, announce=False)
 
     def refresh_report(self):
         A = self.core.accs()
         if self.rp["aid"] and not any(a["id"] == self.rp["aid"] for a in A):
             self.rp["aid"] = ""
         self.rmap = {"Sabhi Khate": ""}
-        self.rmap.update({f"[{a.get('code', '-')}] {a['name']} ({a.get('head', '-')})": a["id"] for a in A})
+        self.rmap.update({f"[{a.get('code', '-')}] {a['name']} ({a.get('head', '-')})": a["id"] for a in self.core.by_kind(A)})
         self.ra["values"] = list(self.rmap)
         cur_label = next((k for k, v in self.rmap.items() if v == self.rp["aid"]), "Sabhi Khate")
         self.ra.set(cur_label)
-        if self.rp["aid"]:
-            acc = self.core.acc(self.rp["aid"])
-            if acc and acc.get("code"):
-                self._syncing_rep_code = True
-                self.rcode.delete(0, "end")
-                self.rcode.insert(0, acc["code"])
-                self._syncing_rep_code = False
-        else:
-            self._syncing_rep_code = True
-            self.rcode.delete(0, "end")
-            self._syncing_rep_code = False
+        self._syncing_rep_code = True
+        self.rcode.delete(0, "end")
+        acc = self.core.acc(self.rp["aid"]) if self.rp["aid"] else None
+        if acc and acc.get("code"):
+            self.rcode.insert(0, acc["code"])
+        self._syncing_rep_code = False
         self.report()
 
-    def rpu(self):
+    def rpu(self, loud=False):
         rp = self.rp
-        report_type = RT[self.rt.current()][0]
+        report_type = RT[max(0, self.rt.current())][0]
         f, t = parse_date(self.rf.get()), parse_date(self.rto.get())
         if f is None or t is None:
-            self.toast("Tareekh DD-MM-YYYY mein likhein")
+            if loud:
+                self.info("Tareekh DD-MM-YYYY mein likhein (jaise 01-04-2026).", "warn")
+            else:
+                self.toast("Tareekh DD-MM-YYYY mein likhein")
             return False
         if f and t and f > t:
             f, t = t, f
@@ -2423,15 +2752,18 @@ class App(tk.Frame):
             w.insert(0, dmy(v) if v else "")
         return True
 
-    def load_report_action(self):
+    def load_report_action(self, quiet=False, announce=True):
+        """Options ke hisaab se report banao. True = ban gayi. quiet=True mein galti par dialog nahi aata."""
         code = self.rcode.get().strip()
         account = None
         if code:
             account = next((a for a in self.core.accs() if norm(a.get("code", "")) == norm(code)), None)
             if not account:
-                return self.info(f"Account Code '{code}' ka koi khata nahi mila!\nKripya sahi code dalein taaki filter mein galti na ho.", "warn")
-        if not self.rpu():
-            return
+                if not quiet:
+                    self.info(f"Account Code '{code}' ka koi khata nahi mila!\nKripya sahi code dalein taaki filter mein galti na ho.", "warn")
+                return False
+        if not self.rpu(loud=not quiet):
+            return False
         if account:
             self.rp["aid"] = account["id"]
             self._syncing_rep_code = True
@@ -2444,13 +2776,17 @@ class App(tk.Frame):
             self.rp["aid"] = self.rmap.get(self.ra.get(), "")
         self.rp["name_filter"] = self.rname.get().strip()
         self.report()
-        self.toast("Report load ho gayi!")
+        if announce:
+            self.toast("Report load ho gayi!")
+        return True
 
     def quick(self, k):
         d = datetime.date.today()
         if k == "m":
             self.rp["from"] = f"{d.year}-{d.month:02d}-01"
             self.rp["to"] = f"{d.year}-{d.month:02d}-{calendar.monthrange(d.year, d.month)[1]:02d}"
+        elif k == "d":
+            self.rp["from"] = self.rp["to"] = d.isoformat()
         elif k == "y":
             s = d.year if d.month > 3 else d.year - 1
             self.rp["from"], self.rp["to"] = f"{s}-04-01", f"{s + 1}-03-31"
@@ -2462,29 +2798,38 @@ class App(tk.Frame):
         self.load_report_action()
 
     def report(self):
+        tr = self.r_tree
         if not self.core.office():
             self.last = None
             self.rh.config(text="Pehle Office banayein")
-            fill(self.r_tree, [])
+            self.rn.config(text="")
+            self.draw_report_cards([])
+            fill(tr, [])
             return
         rep = self.last = self.core.report(self.rp)
         s = self.db.get("setup") or DS
-        self.rh.config(text="\n".join(x for x in (rep.get("office"), rep.get("addr"), s.get("title"), rep.get("title"),
-                                                  f"Avadhi: {rep.get('per', '')}   |   Khata: {rep.get('acc', '')}") if x))
+        top = "  •  ".join(x for x in (rep.get("office"), rep.get("addr"), s.get("title")) if x)
+        self.rh.config(text="\n".join(x for x in (top, f"{rep.get('title', '')}   |   Avadhi: {rep.get('per', '')}   |   Khata: {rep.get('acc', '')}") if x))
+        self.draw_report_cards(rep.get("cards") or [])
         H, R, F = rep.get("H", []), rep.get("R", []), rep.get("F", [])
-        tr = self.r_tree
+        al = rep.get("align") or ["r" if isinstance(x, (int, float)) else "l" for x in F]
+        sub = rep.get("sub") or set()
+        anc = {"l": "w", "c": "center", "r": "e"}
         ids = [f"c{i}" for i in range(len(H))]
         tr.configure(columns=ids)
         for i, h in enumerate(H):
-            num = isinstance(F[i], (int, float))
-            tr.heading(ids[i], text=h, anchor="e" if num else "center" if h == "Code" else "w")
-            w_col = 70 if h == "Code" else 260 if h == "विवरण" else 160 if h in ("खाता", "Avadhi", "Expense Head") else 110
-            tr.column(ids[i], width=w_col, anchor="e" if num else "center" if h == "Code" else "w", stretch=True)
+            tr.heading(ids[i], text=h, anchor=anc[al[i]])
+            tr.column(ids[i], width=int(self.REP_W.get(h, 120) * K), minwidth=int(50 * K), anchor=anc[al[i]], stretch=(al[i] == "l"))
         tr.delete(*tr.get_children())
         for i, r in enumerate(R[:MAXPREV]):
-            tr.insert("", "end", values=["" if c == "" else self.core.cell(c, j, F) for j, c in enumerate(r)], tags=("odd",) if i % 2 else ())
+            tags = ("sub",) if i in sub else (("odd",) if i % 2 else ())
+            tr.insert("", "end", values=["" if c == "" else self.core.cell(c, j, F) for j, c in enumerate(r)], tags=tags)
         tr.insert("", "end", values=["" if c == "" else self.core.cell(c, j, F) for j, c in enumerate(F)], tags=("foot",))
-        extra = f"Preview mein pehli {MAXPREV} panktiyan (Kul {len(R)}) — Print / Excel mein poori report आयegi." if len(R) > MAXPREV else ""
+        tr.yview_moveto(0)
+        tr.xview_moveto(0)
+        extra = f"Preview mein pehli {MAXPREV} panktiyan (Kul {len(R)}) — Print / Excel mein poori report aayegi." if len(R) > MAXPREV else ""
+        if not R:
+            extra = "इस अवधि / फ़िल्टर में कोई रिकॉर्ड नहीं है।"
         self.rn.config(text="\n".join(x for x in (rep["note"], extra) if x))
 
     @staticmethod
@@ -2498,7 +2843,8 @@ class App(tk.Frame):
                 pass
 
     def print_report(self):
-        if not self.last:
+        # Print se pehle options dobara padh lete hain, taaki naya (badla hua) filter/tareekh hi print ho.
+        if not self.load_report_action(announce=False) or not self.last:
             return
         self.cleanup_reports()
         fd, path = tempfile.mkstemp(suffix=".html", prefix="SmartAccount_Report_")
@@ -2508,9 +2854,9 @@ class App(tk.Frame):
         self.toast("Report browser mein khul gayi — Print / Save as PDF chunein")
 
     def export_csv(self):
-        rep = self.last
-        if not rep:
+        if not self.load_report_action(announce=False) or not self.last:
             return
+        rep = self.last
         p = filedialog.asksaveasfilename(parent=self, title="CSV Save Karein", defaultextension=".csv",
                                          initialfile=f"Report_{self.rp['type']}_{today()}.csv", filetypes=[("CSV", "*.csv")])
         if not p:
@@ -2523,6 +2869,8 @@ class App(tk.Frame):
             return "'" + s if s.lstrip(" \t\r\n\ufeff")[:1] in ("=", "+", "-", "@") else s
 
         rows = [[rep["office"]], [rep["title"]], ["Avadhi: " + rep["per"]], rep["H"], *rep["R"], rep["F"]]
+        if rep.get("note"):
+            rows.append([rep["note"].replace("\n", " ")])
 
         def write(f):
             w = csv.writer(f, quoting=csv.QUOTE_ALL, lineterminator="\r\n")
@@ -2586,12 +2934,13 @@ class App(tk.Frame):
                               command=lambda k=k: self.set_theme(k)))
         bf2 = ttk.LabelFrame(t, text="Backup / Restore", padding=10)
         bf2.pack(fill="x", padx=8, pady=4)
-        nl = ttk.Label(bf2, text="Data sap.db (SQLite) mein save rehta hai. Backup JSON aur DB dono mein liya ja sakta hai.",
+        nl = ttk.Label(bf2, text="Data sap.db (SQLite) mein save rehta hai. Backup JSON aur DB dono mein liya ja sakta hai. Roz band karte samay apne-aap bhi backup (sap_auto_backup folder, 14 din) banta hai; Restore se pehle bhi safety copy banti hai.",
                        foreground="#5c6f69", wraplength=600)
         nl.pack(fill="x")
         r = Flow(bf2, 170, "w")
         r.pack(fill="x", pady=6)
-        for txt, cmd in (("⬇ Backup Save Karein", self.backup), ("⬆ Restore Karein", self.restore), ("🗑 Sara Data Mitayein", self.reset_all)):
+        for txt, cmd in (("⬇ Backup Save Karein", self.backup), ("⬆ Restore Karein", self.restore),
+                         ("📂 Auto-Backup Folder", self.open_auto_dir), ("🗑 Sara Data Mitayein", self.reset_all)):
             r.add(ttk.Button(r, text=txt, command=cmd, style="Danger.TButton" if "Mitayein" in txt else "TButton"))
         self.lbk = ttk.Label(bf2, foreground="#5c6f69")
         self.lbk.pack(anchor="w")
@@ -2601,8 +2950,13 @@ class App(tk.Frame):
         dl.pack(side="left", fill="x", expand=True)
         ttk.Button(dr, text="Open", command=self.open_data_dir).pack(side="right")
 
-    def open_data_dir(self):
-        folder = os.path.dirname(os.path.abspath(DB_FILE))
+    def open_auto_dir(self):
+        if not os.path.isdir(self.auto_dir()):
+            return self.info("Abhi koi auto-backup nahi bana (ye program band karte samay banta hai).", "info")
+        self.open_data_dir(self.auto_dir())
+
+    def open_data_dir(self, folder=None):
+        folder = folder or os.path.dirname(os.path.abspath(DB_FILE))
         try:
             if os.name == "nt":
                 os.startfile(folder)
@@ -2621,6 +2975,8 @@ class App(tk.Frame):
         n = self.on.get().strip()
         if not n:
             return self.info("Office ka naam likhein.", "warn")
+        if any(x["name"].strip().casefold() == n.casefold() for x in self.db["offices"]):
+            return self.info("Is naam ka office pehle se maujud hai.", "warn")
         o = {"id": uid(), "name": n, "addr": self.oa.get().strip()}
         self.db["offices"].append(o)
         self.db["cur"] = o["id"]
@@ -2654,7 +3010,9 @@ class App(tk.Frame):
         o = next((x for x in self.db["offices"] if x["id"] == oid), None)
         if not o:
             return self.toast("Pehle office chunein")
-        if not self.ask(f'"{o["name"]}" aur iske sabhi khate Delete?'):
+        na = sum(1 for a in self.db["accounts"] if a["oid"] == oid)
+        nt = sum(1 for t in self.db["tx"] if t["oid"] == oid)
+        if not self.ask(f'"{o["name"]}" Delete? Iske {na} khate aur {nt} entries bhi hat jayengi (pehle safety copy banegi).'):
             return
         if not self.safety_copy("office"):
             return
@@ -2674,6 +3032,28 @@ class App(tk.Frame):
 
     BK_FMT = ["JSON + DB Dono", "Sirf JSON", "Sirf DB (SQLite)"]
 
+    def auto_dir(self):
+        return os.path.join(os.path.dirname(os.path.abspath(DB_FILE)), "sap_auto_backup")
+
+    def _verify_backup(self, path, kind):
+        """Backup likhne ke baad wapas padhkar check karo ki office/khate/entry ginti barabar hai."""
+        want = (len(self.db["offices"]), len(self.db["accounts"]), len(self.db["tx"]))
+        if kind == "json":
+            with open(path, encoding="utf-8") as f:
+                d = json.load(f)
+            got = tuple(len(d.get(k) or []) for k in ("offices", "accounts", "tx"))
+        else:
+            con = sqlite3.connect(path)
+            try:
+                res = con.execute("PRAGMA quick_check(1)").fetchone()
+                if not res or res[0] != "ok":
+                    raise sqlite3.DatabaseError("DB backup check fail: %s" % (res[0] if res else "?"))
+                got = tuple(con.execute(f"SELECT COUNT(*) FROM {tb}").fetchone()[0] for tb in ("offices", "accounts", "tx"))
+            finally:
+                con.close()
+        if got != want:
+            raise OSError(f"{kind.upper()} backup adhura bana (office/khate/entry {got} mile, {want} hone chahiye).")
+
     def backup(self):
         r = form_dialog(self, "Backup", [("choice", "Backup Format", self.BK_FMT[0], self.BK_FMT)])
         if r is None:
@@ -2683,14 +3063,22 @@ class App(tk.Frame):
         want_json, want_db = i in (0, 1), i in (0, 2)
         ext = ".db" if i == 2 else ".json"
         types = [("SQLite DB", "*.db")] if i == 2 else [("JSON", "*.json")]
+        kw = {"initialdir": self._bk_dir} if self._bk_dir and os.path.isdir(self._bk_dir) else {}
         p = filedialog.asksaveasfilename(parent=self, title="Backup Save Karein", defaultextension=ext,
-                                         initialfile=f"SmartAccount_Backup_{today()}{ext}", filetypes=types)
+                                         initialfile=f"SmartAccount_Backup_{today()}{ext}", filetypes=types, **kw)
         if not p:
             return
         base = os.path.splitext(p)[0]
         live = os.path.normcase(os.path.abspath(DB_FILE))
         if want_db and os.path.normcase(os.path.abspath(base + ".db")) == live:
             return self.info("Backup ko chalu sap.db ke upar nahi likha ja sakta.", "error")
+        # Dialog sirf chuni hui file ke overwrite ke baare mein poochta hai; saath wali doosri file ke liye hum poochte hain.
+        chosen = os.path.normcase(os.path.abspath(p))
+        for want, path in ((want_json, base + ".json"), (want_db, base + ".db")):
+            if want and os.path.normcase(os.path.abspath(path)) != chosen and os.path.exists(path):
+                if not self.ask(f"{os.path.basename(path)} pehle se maujud hai. Badal dein?"):
+                    return
+        self._bk_dir = os.path.dirname(os.path.abspath(p))
         backup_date = today()
         old_backup_date = self.db.get("lastBk")
         saved = []
@@ -2701,6 +3089,7 @@ class App(tk.Frame):
                 backup_data = dict(self.db)
                 backup_data["lastBk"] = backup_date
                 atomic_write(base + ".json", lambda f: json.dump(backup_data, f, ensure_ascii=False, indent=1), encoding="utf-8")
+                self._verify_backup(base + ".json", "json")
                 saved.append("JSON")
             if want_db:
                 tmp = base + ".db.tmp"
@@ -2713,9 +3102,15 @@ class App(tk.Frame):
                         bc.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('lastBk',?)", (backup_date,))
                 finally:
                     bc.close()
+                self._verify_backup(tmp, "db")
                 os.replace(tmp, base + ".db")
                 saved.append("DB")
         except (OSError, sqlite3.Error, TypeError, ValueError) as e:
+            try:
+                if os.path.exists(base + ".db.tmp"):
+                    os.remove(base + ".db.tmp")
+            except OSError:
+                pass
             return self.info(f"Backup save nahi ho saka:\n{e}", "error")
         self.db["lastBk"] = backup_date
         if not self.core.save():
@@ -2724,7 +3119,7 @@ class App(tk.Frame):
             self.refresh_all()
             return self.info("Backup file ban gayi par lastBk save nahi hua.", "error")
         self.refresh_all()
-        self.toast("Backup save ho gaya (" + " + ".join(saved) + ")")
+        self.toast("Backup save ho gaya aur check bhi ho gaya (" + " + ".join(saved) + ")")
 
     @staticmethod
     def load_backup(p):
@@ -2743,6 +3138,8 @@ class App(tk.Frame):
                     con = sqlite3.connect(p)
                     con.execute("PRAGMA query_only=ON")
                 d = Core.read(con)
+                if not con.execute("SELECT 1 FROM meta WHERE key='setup'").fetchone():
+                    d["__no_setup"] = True
             finally:
                 if con is not None:
                     con.close()
@@ -2754,31 +3151,60 @@ class App(tk.Frame):
         return d
 
     def restore(self):
+        kw = {}
+        for cand in (self._bk_dir, self.auto_dir()):
+            if cand and os.path.isdir(cand):
+                kw["initialdir"] = cand
+                break
         p = filedialog.askopenfilename(parent=self, title="Backup Chunein",
-                                       filetypes=[("Backup (JSON / DB)", "*.json *.db"), ("All", "*.*")])
+                                       filetypes=[("Backup (JSON / DB)", "*.json *.db"), ("All", "*.*")], **kw)
         if not p:
             return
+        self._bk_dir = os.path.dirname(os.path.abspath(p))
         Core.skipped = 0
         try:
             d = self.load_backup(p)
-        except (OSError, sqlite3.Error, UnicodeError, ValueError, TypeError, KeyError) as exc:
+        except json.JSONDecodeError:
             log_error(f"Backup load failed: {p}\n{traceback.format_exc()}")
-            return self.info(f"Backup file load nahi ho saki:\n{exc}", "error")
-        if not self.ask("Maujuda data hat jayega aur backup se replace ho jayega. Jari rakhein?"):
-            return
+            return self.info("Yeh file Smart Account ka backup nahi lagti (JSON / DB format sahi nahi).", "error")
+        except sqlite3.Error as exc:
+            log_error(f"Backup load failed: {p}\n{traceback.format_exc()}")
+            return self.info(f"Yeh DB Smart Account ka sahi backup nahi hai ya kharab hai:\n{exc}", "error")
+        except (OSError, UnicodeError, ValueError, TypeError, KeyError) as exc:
+            log_error(f"Backup load failed: {p}\n{traceback.format_exc()}")
+            return self.info("Backup file load nahi ho saki" + (":\n" + str(exc) if str(exc) != "not a backup" else
+                                                               " — yeh Smart Account ka backup nahi hai."), "error")
+        # Purane backup mein setup / theme na ho to maujuda Page Setup aur Theme na bigadein.
+        if d.pop("__no_setup", False) or not isinstance(d.get("setup"), dict):
+            d["setup"] = self.db["setup"]
+        if "theme" not in d:
+            d["theme"] = self.db.get("theme", "")
         c = Core.clean(d)
         skipped = Core.skipped
         if (d.get("offices") or d.get("tx")) and not c["offices"] and not c["tx"]:
             return self.info("Backup rows read nahi ho saki.", "error")
+        n_b = (len(c["offices"]), len(c["accounts"]), len(c["tx"]))
+        n_now = (len(self.db["offices"]), len(self.db["accounts"]), len(self.db["tx"]))
+        dates = [t["date"] for t in c["tx"]]
+        rng = f"\nEntries ki tareekh: {dmy(min(dates))} se {dmy(max(dates))}" if dates else ""
+        msg = (f"Backup mein: {n_b[0]} office, {n_b[1]} khate, {n_b[2]} entry.{rng}\n"
+               f"Maujuda data: {n_now[0]} office, {n_now[1]} khate, {n_now[2]} entry.\n\n"
+               "Maujuda data hat jayega aur backup se replace ho jayega (pehle ek safety copy ban jayegi). Jari rakhein?")
+        if not n_b[0] and not n_b[2] and (n_now[0] or n_now[2]):
+            msg = "⚠ Is backup mein koi data nahi hai! Restore karne par maujuda sara data mit jayega.\n\n" + msg
+        if not self.ask(msg):
+            return
         if not self.safety_copy("restore"):
             return
         try:
             self.core.replace_all(c)
         except Exception as e:
-            return self.info(f"Restore nahi ho saka.\n{e}", "error")
+            log_error(traceback.format_exc())
+            return self.info(f"Restore nahi ho saka. Purana data jaisa tha waisa hi hai.\n{e}", "error")
         self.edit = None
+        self.rp["aid"] = ""
         self.apply_theme()
-        self.commit("Restore pura hua")
+        self.commit(f"Restore pura hua: {n_b[0]} office, {n_b[1]} khate, {n_b[2]} entry")
         self.nb.select(self.t_dash)
         if skipped:
             self.info(f"Restore ho gaya, par {skipped} tootey records chhod diye gaye.", "warn")
@@ -2786,7 +3212,7 @@ class App(tk.Frame):
     def reset_all(self):
         if not self.ask("Sara data mit jayega!"):
             return
-        if not self.ask("Pakka? Yeh wapas nahi आयega."):
+        if not self.ask("Pakka? Yeh wapas nahi aayega."):
             return
         old = self.db
         if not self.safety_copy("reset"):
@@ -2797,6 +3223,45 @@ class App(tk.Frame):
             return self.info(f"Data mitaya nahi ja saka:\n{e}", "error")
         self.edit = None
         self.commit("Sara data mita diya")
+
+def recover_corrupt_db(parent):
+    """sap.db kharab ho to sabse naye sahi auto-backup se wapas laane ka option dena. True = wapas laa diya."""
+    folder = os.path.join(os.path.dirname(os.path.abspath(DB_FILE)), "sap_auto_backup")
+
+    def _mtime(p):
+        try:
+            return os.path.getmtime(p)
+        except OSError:
+            return 0
+    for p in sorted(glob.glob(os.path.join(glob.escape(folder), "sap_*.db")), key=_mtime, reverse=True):
+        try:
+            con = sqlite3.connect(Path(os.path.abspath(p)).as_uri() + "?mode=ro", uri=True)
+            try:
+                if con.execute("PRAGMA quick_check(1)").fetchone()[0] != "ok":
+                    continue
+                d = Core.read(con)
+            finally:
+                con.close()
+        except Exception:
+            continue
+        when = datetime.datetime.fromtimestamp(_mtime(p)).strftime("%d-%m-%Y %I:%M %p")
+        if not messagebox.askyesno("Smart Account Pro",
+                                   "sap.db kharab ho gayi hai.\n\nSabse naya sahi backup mila:\n"
+                                   f"{os.path.basename(p)}  ({when})\n"
+                                   f"{len(d['offices'])} office, {len(d['accounts'])} khate, {len(d['tx'])} entry.\n\n"
+                                   "Kharab file alag naam se rakhkar isse wapas laayein?", parent=parent):
+            return False
+        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        try:
+            for suf in ("", "-wal", "-shm"):
+                if os.path.exists(DB_FILE + suf):
+                    shutil.move(DB_FILE + suf, os.path.join(os.path.dirname(os.path.abspath(DB_FILE)), f"sap_corrupt_{stamp}.db{suf}"))
+            shutil.copy2(p, DB_FILE)
+            return True
+        except OSError:
+            log_error(traceback.format_exc())
+            return False
+    return False
 
 def main():
     if os.name == "nt":
@@ -2810,7 +3275,18 @@ def main():
     root = None
     try:
         root = tk.Tk()
-        app = App(root)
+        try:
+            app = App(root)
+        except RuntimeError as e:
+            if "corrupt" not in str(e):
+                raise
+            root.withdraw()
+            if not recover_corrupt_db(root):
+                raise
+            for w in root.winfo_children():
+                w.destroy()
+            root.deiconify()
+            app = App(root)
         app.pack(fill="both", expand=True)
     except Exception as e:
         log_error(traceback.format_exc())

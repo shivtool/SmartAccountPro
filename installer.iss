@@ -8,7 +8,7 @@
 #define AppExe       "SmartAccountPro.exe"
 #define AppPublisher "Shiv Computer"
 #ifndef AppVersion
-  #define AppVersion "2.0.1"
+  #define AppVersion "2.0.4"
 #endif
 #define AppId        "{{6B3E2F0A-5D7C-4E1B-9A41-5A7C0C2E9D11}"
 #define Dist64       "build\x64\sap.dist"
@@ -121,6 +121,7 @@ var
   PrevPage: TWizardPage;
   HavePrev: Boolean;
   PrevVersion, PrevDataDir, PrevAppDir: String;
+  PreUpgradeBackupPath: String;
   UnDataDir: String;
   UnRemoveData, UnBackup: Boolean;
   LegacyMigrationOk: Boolean;
@@ -210,11 +211,17 @@ end;
 procedure InitializeWizard;
 var
   Info: TNewStaticText;
+  D: String;
 begin
   HavePrev := FindPrevious;
-  if not HavePrev then Exit;
-  PrevPage := CreateCustomPage(wpWelcome, 'Existing installation found / पुराना version मिला',
-    '{#AppName} ' + PrevVersion + ' is already installed. This setup will upgrade it and keep your accounting data.');
+  D := DataDir('');
+  if not HavePrev and not (FileExists(D + '\sap.db') or FileExists(D + '\smart_account_data.json')) then Exit;
+  if HavePrev then
+    PrevPage := CreateCustomPage(wpWelcome, 'Existing installation found / पुराना version मिला',
+      '{#AppName} ' + PrevVersion + ' is already installed. This setup will upgrade it and keep your accounting data.')
+  else
+    PrevPage := CreateCustomPage(wpWelcome, 'Existing data found / पुराना data मिला',
+      'Existing Smart Account Pro accounting data was found. This setup will keep it and create a safety copy.');
   Info := TNewStaticText.Create(PrevPage);
   Info.Parent := PrevPage.Surface;
   Info.Left := 0;
@@ -222,9 +229,17 @@ begin
   Info.Width := PrevPage.SurfaceWidth;
   Info.AutoSize := True;
   Info.WordWrap := True;
-  Info.Caption := 'Installed: {#AppName} ' + PrevVersion + '   ->   New: {#AppVersion}' + #13#10 +
-                  'Data folder: ' + DataDir('') + #13#10#13#10 +
-                  'Upgrade mode keeps your existing data and backups. No clean-install or data-delete option is offered here.' + #13#10 +
+  if HavePrev then
+    Info.Caption := 'Installed: {#AppName} ' + PrevVersion + '   ->   New: {#AppVersion}' + #13#10 +
+                    'UPGRADE: Existing installation and data folder will be kept.' + #13#10 +
+                    'DATA: ' + D + #13#10
+  else
+    Info.Caption := 'DATA: Existing accounting data was found.' + #13#10 +
+                    'DATA FOLDER: ' + D + #13#10;
+  Info.Caption := Info.Caption +
+                  'SAFETY: After the app closes, a copy is saved in Documents before files are updated.' + #13#10 +
+                  'If that safety copy cannot be created, setup stops without updating the app.' + #13#10#13#10 +
+                  'Your accounts, settings, and automatic backups are not removed.' + #13#10 +
                   'Agar program khula hai, installer pehle use safely close karne ko kahega.';
 end;
 
@@ -284,7 +299,18 @@ end;
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   L: TArrayOfString;
+  D: String;
 begin
+  if CurStep = ssInstall then
+  begin
+    D := DataDir('');
+    if (FileExists(D + '\sap.db') or FileExists(D + '\smart_account_data.json')) and
+       not BackupFolder(D, PreUpgradeBackupPath) then
+      RaiseException('The existing data could not be backed up. Setup stopped before updating the app.' +
+                     ' Original data folder: ' + D + #13#10#13#10 +
+                     'Make space in Documents or check its permissions, then run setup again.');
+    Exit;
+  end;
   if CurStep = ssPostInstall then
   begin
     LegacyMigrationOk := True;
@@ -299,6 +325,10 @@ begin
              mbError, MB_OK);
     end;
   end;
+  if (CurStep = ssDone) and (PreUpgradeBackupPath <> '') then
+    SuppressibleMsgBox('A safety copy of your existing data was saved before the upgrade:' + #13#10 +
+                       PreUpgradeBackupPath,
+                       mbInformation, MB_OK, IDOK);
 end;
 
 // ---------------------------------------------------------------- uninstall

@@ -22,6 +22,8 @@ INSTALLER KYA KARTA HAI
   (sap.db, roz ke auto-backup, error log). App ke Settings mein "Data folder" aur "Kholen" button hai.
 - Naya installer purane version ko upgrade karta hai: wahi App ID aur purana install folder use hota hai.
   Upgrade ke dauran accounts database, auto-backup aur data folder delete nahi hote.
+- Upgrade se pehle existing data folder ki safety copy Documents mein banti hai. Copy na ban sake
+  (jaise disk space ya permissions ki kami) to installer upgrade rok deta hai; original data wahi rehta hai.
 - Purana data folder registry mein milne par wahi reuse hota hai. Bahut purane portable install
   mein `sap.db` ya JSON ho to pehle data folder mein copy hoti hai; source copy migration ke baad bhi rehti hai.
 - Upgrade wizard mein clean-install ya data-delete option nahi hai. Data hatana ho to uninstall ke
@@ -29,7 +31,7 @@ INSTALLER KYA KARTA HAI
 - Desktop shortcut (optional), Start Menu shortcuts, "Open Data Folder" shortcut.
 
 SILENT / LAN DEPLOYMENT
-  Upgrade   : SmartAccountPro_Setup_2.0.1.exe /VERYSILENT /NORESTART          (purana data rakhta hai)
+  Upgrade   : SmartAccountPro_Setup_2.0.4.exe /VERYSILENT /NORESTART          (purana data rakhta hai)
   Uninstall : "...\unins000.exe" /VERYSILENT                                    (data rakhta hai)
               "...\unins000.exe" /VERYSILENT /REMOVEDATA                        (data hatata hai, backup ke saath)
               "...\unins000.exe" /VERYSILENT /REMOVEDATA /NOBACKUP              (bina backup)
